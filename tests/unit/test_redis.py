@@ -1,5 +1,8 @@
+import asyncio
 import inspect
 import json
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -36,6 +39,7 @@ from litellm.caching.redis_cache import RedisCache
 from litellm.caching.redis_cluster_cache import RedisClusterCache
 from litellm.constants import REDIS_CLUSTER_HEALTH_CHECK_INTERVAL
 from litellm.proxy._types import CoordinationRedisParams
+from tests.integration._support.redis_process import owned_redis
 
 
 class _StubCredentialProvider(CredentialProvider):
@@ -1960,3 +1964,114 @@ def test_async_sentinel_keeps_the_credential_provider_off_the_monitors(markers, 
     master_kwargs = mock_sentinel_cls.return_value.master_for.call_args[1]
     assert isinstance(master_kwargs["credential_provider"], provider_cls)
     assert "password" not in master_kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("redis-server") is None, reason="Lua drain needs a real redis-server")
+@pytest.mark.parametrize("redis_version", ["6.0", 6.1])
+async def test_async_drain_list_to_processing_keeps_legacy_redis_rows_pending_in_order(
+    redis_version: str | float,
+    tmp_path: Path,
+) -> None:
+    with owned_redis(tmp_path) as redis_server:
+        redis_cache: Final = RedisCache(host=redis_server.host, port=redis_server.port, namespace="drain-test")
+        redis_cache.redis_version = redis_version
+        redis_client: Final = async_redis.Redis(host=redis_server.host, port=redis_server.port)
+        try:
+            rows: Final = ("row-1", "row-2", "row-3", "row-4", "row-5")
+            await redis_client.rpush("drain-test:buffer", *rows)
+
+            first_batch: Final = await redis_cache.async_drain_list_to_processing(
+                key="buffer",
+                worker_id="worker-1",
+                count=2,
+                ttl_seconds=60,
+            )
+            processing_key: Final = "drain-test:buffer:processing:worker-1"
+            assert first_batch == ["row-1", "row-2"]
+            assert await redis_client.llen(processing_key) == 2
+            assert await redis_client.lrange("drain-test:buffer", 0, -1) == [b"row-3", b"row-4", b"row-5"]
+
+            pending_batch: Final = await redis_cache.async_drain_list_to_processing(
+                key="buffer",
+                worker_id="worker-1",
+                count=2,
+                ttl_seconds=60,
+            )
+            assert pending_batch == ["row-1", "row-2"]
+            assert await redis_client.lrange(processing_key, 0, -1) == [b"row-1", b"row-2"]
+
+            await redis_cache.async_ack_processing_list(key="buffer", worker_id="worker-1")
+            next_batch: Final = await redis_cache.async_drain_list_to_processing(
+                key="buffer",
+                worker_id="worker-1",
+                count=2,
+                ttl_seconds=60,
+            )
+            assert next_batch == ["row-3", "row-4"]
+            assert await redis_client.lrange("drain-test:buffer", 0, -1) == [b"row-5"]
+        finally:
+            await redis_client.aclose()
+            await redis_cache.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("redis-server") is None, reason="Lua drain needs a real redis-server")
+async def test_lua_drain_as_half_open_probe_closes_the_circuit_breaker(tmp_path: Path) -> None:
+    with owned_redis(tmp_path) as redis_server:
+        redis_cache: Final = RedisCache(host=redis_server.host, port=redis_server.port, namespace="drain-test")
+        redis_cache.redis_version = "6.0.16"
+        breaker: Final = redis_cache._circuit_breaker
+        redis_client: Final = async_redis.Redis(host=redis_server.host, port=redis_server.port)
+        try:
+            await redis_client.rpush("drain-test:buffer", "row-1")
+            for _ in range(breaker.failure_threshold):
+                breaker.record_failure()
+            assert breaker.state == breaker.OPEN
+            breaker.recovery_timeout = 0
+            await asyncio.sleep(0.01)
+
+            drained: Final = await redis_cache.async_drain_list_to_processing(
+                key="buffer",
+                worker_id="worker-1",
+                count=1,
+                ttl_seconds=60,
+            )
+
+            assert drained == ["row-1"]
+            assert breaker.state == breaker.CLOSED
+            await redis_cache.async_set_cache("after-probe", "ok")
+            assert await redis_client.get("drain-test:after-probe") is not None
+        finally:
+            await redis_client.aclose()
+            await redis_cache.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("redis-server") is None, reason="Lua drain needs a real redis-server")
+@pytest.mark.parametrize("redis_version", ["Unknown", "latest", ""])
+async def test_async_drain_list_to_processing_uses_lua_when_redis_version_is_unknown(
+    redis_version: str,
+    tmp_path: Path,
+) -> None:
+    with owned_redis(tmp_path) as redis_server:
+        redis_cache: Final = RedisCache(host=redis_server.host, port=redis_server.port, namespace="drain-test")
+        redis_cache.redis_version = redis_version
+        redis_client: Final = async_redis.Redis(host=redis_server.host, port=redis_server.port)
+        try:
+            await redis_client.execute_command("ACL", "SETUSER", "default", "-lmove")
+            await redis_client.rpush("drain-test:buffer", "row-1", "row-2", "row-3")
+
+            drained: Final = await redis_cache.async_drain_list_to_processing(
+                key="buffer",
+                worker_id="worker-1",
+                count=2,
+                ttl_seconds=60,
+            )
+
+            assert drained == ["row-1", "row-2"]
+            assert await redis_client.lrange("drain-test:buffer:processing:worker-1", 0, -1) == [b"row-1", b"row-2"]
+            assert await redis_client.lrange("drain-test:buffer", 0, -1) == [b"row-3"]
+        finally:
+            await redis_client.aclose()
+            await redis_cache.disconnect()

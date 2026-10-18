@@ -219,6 +219,8 @@ _SERVICE_VERB_BY_CALL_TYPE: Final[dict[str, str]] = {
     "async_delete_cache": "delete",
     "async_rpush": "rpush",
     "async_lpop": "lpop",
+    "async_drain_list_to_processing": "lmove",
+    "async_ack_processing_list": "delete",
     "async_scan_iter": "scan",
     "async_lpop_pipeline": "lpop",
     "async_rpush_pipeline": "rpush",

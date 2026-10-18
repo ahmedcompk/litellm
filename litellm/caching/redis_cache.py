@@ -20,7 +20,7 @@ import threading
 import time
 import weakref
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
@@ -72,6 +72,43 @@ else:
     Span = Any
 
 
+class _AsyncRedisListPipeline(Protocol):
+    async def __aenter__(self) -> "_AsyncRedisListPipeline": ...
+
+    async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None: ...
+
+    def lmove(self, first_list: str, second_list: str, src: str, dest: str) -> "_AsyncRedisListPipeline": ...
+
+    def lpop(self, name: str) -> "_AsyncRedisListPipeline": ...
+
+    def expire(self, name: str, time: int) -> "_AsyncRedisListPipeline": ...
+
+    async def execute(self) -> list[object]: ...
+
+
+_LPOP_TO_PROCESSING_SCRIPT: Final = """
+local moved = {}
+for i = 1, tonumber(ARGV[1]) do
+  local v = redis.call('LPOP', KEYS[1])
+  if not v then break end
+  redis.call('RPUSH', KEYS[2], v)
+  moved[#moved + 1] = v
+end
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[2]))
+return moved
+"""
+
+
+class _RedisServiceLogger(Protocol):
+    def async_service_success_hook(
+        self, service: ServiceTypes, call_type: str, duration: float, caller: str
+    ) -> Coroutine[object, object, None]: ...
+
+    def async_service_failure_hook(
+        self, service: ServiceTypes, duration: float, error: Exception, call_type: str, caller: str
+    ) -> Coroutine[object, object, None]: ...
+
+
 class _AsyncRedisCommands(Protocol):
     """Async redis commands this cache issues.
 
@@ -90,6 +127,8 @@ class _AsyncRedisCommands(Protocol):
     def rpush(self, name: str, *values: str | bytes | float) -> Awaitable[int]: ...
 
     def lpop(self, name: str, count: int | None = None) -> Awaitable[object]: ...
+
+    def lrange(self, name: str, start: int, end: int) -> Awaitable[list[bytes | str]]: ...
 
     def pipeline(self, transaction: bool = True) -> "Pipeline[bytes]": ...
 
@@ -140,6 +179,7 @@ _INCREMENT_IF_PRESENT_LUA: Final = (
 
 _LUA_COUNT: Final = TypeAdapter(int)
 _LUA_OPTIONAL_TOTAL: Final[TypeAdapter[float | None]] = TypeAdapter(float | None)
+_LUA_LIST_RESULT: Final = TypeAdapter(list[bytes | str | None])
 _OPTIONAL_COUNTS: Final = TypeAdapter(tuple[int | None, ...])
 
 
@@ -147,6 +187,23 @@ def _decoded_counts(values: Sequence[bytes | str | None]) -> tuple[int | None, .
     return _OPTIONAL_COUNTS.validate_python(
         tuple(value.decode("utf-8") if isinstance(value, bytes) else value for value in values)
     )
+
+
+def _supports_lmove(redis_version: str | float) -> bool:
+    version_parts: Final = str(redis_version).strip().split("-", maxsplit=1)[0].split(".")
+    if not version_parts[0].isdigit():
+        return False
+    minor_part: Final = version_parts[1] if len(version_parts) > 1 else ""
+    minor_version: Final = int(minor_part) if minor_part.isdigit() else 0
+    return (int(version_parts[0]), minor_version) >= (6, 2)
+
+
+def _decode_redis_list(values: Sequence[bytes | str | None]) -> list[str]:
+    return [
+        value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+        for value in values
+        if value is not None
+    ]
 
 
 def _is_generic_caller_frame(frame: FrameType) -> bool:
@@ -685,7 +742,7 @@ class RedisCache(BaseCache):
             self.redis_flush_size: int = 100
         else:
             self.redis_flush_size = redis_flush_size
-        self.redis_version: str = "Unknown"
+        self.redis_version: str | int | float = "Unknown"
         try:
             if not coroutine_checker.is_async_callable(self.redis_client):
                 self.redis_version = self.redis_client.info()["redis_version"]
@@ -2450,6 +2507,150 @@ class RedisCache(BaseCache):
             else:
                 decoded_results.append(None)
         return decoded_results
+
+    async def _async_move_list_to_processing(
+        self,
+        redis_client: _AsyncRedisCommands,
+        namespaced_key: str,
+        processing_key: str,
+        count: int,
+        ttl_seconds: int,
+    ) -> list[str]:
+        if not _supports_lmove(self.redis_version):
+            script_results: Final = await redis_client.eval(
+                _LPOP_TO_PROCESSING_SCRIPT, 2, namespaced_key, processing_key, count, ttl_seconds
+            )
+            return _decode_redis_list(_LUA_LIST_RESULT.validate_python(script_results))
+
+        list_pipeline: Final = cast(  # cast-ok: RedisCluster stubs omit list commands
+            _AsyncRedisListPipeline,
+            redis_client.pipeline(transaction=False),
+        )
+        async with list_pipeline as pipe:
+            for _ in range(count):
+                pipe.lmove(namespaced_key, processing_key, src="LEFT", dest="RIGHT")
+            pipe.expire(processing_key, ttl_seconds)
+            raw_results: Final = await pipe.execute()
+
+        filtered_results: Final = tuple(
+            result for result in raw_results[:-1] if result is None or isinstance(result, (bytes, str))
+        )
+        return _decode_redis_list(filtered_results)
+
+    def _processing_list_key(self, namespaced_key: str, worker_id: str) -> str:
+        return f"{namespaced_key}:processing:{worker_id}"
+
+    @_redis_circuit_breaker_guard
+    async def async_drain_list_to_processing(self, key: str, worker_id: str, count: int, ttl_seconds: int) -> list[str]:
+        _redis_client: Final = self._async_commands()
+        namespaced_key: Final = self.check_and_fix_namespace(key)
+        processing_key: Final = self._processing_list_key(
+            namespaced_key=namespaced_key,
+            worker_id=worker_id,
+        )
+        start_time: Final = time.time()
+        service_logger: Final = cast(  # cast-ok: logger has the required hooks
+            _RedisServiceLogger,
+            self.service_logger_obj,
+        )
+
+        try:
+            pending_items: Final = _decode_redis_list(await _redis_client.lrange(processing_key, 0, -1))
+            drained_items: Final = (
+                pending_items
+                if pending_items
+                else await self._async_move_list_to_processing(
+                    redis_client=_redis_client,
+                    namespaced_key=namespaced_key,
+                    processing_key=processing_key,
+                    count=count,
+                    ttl_seconds=ttl_seconds,
+                )
+            )
+            end_time: Final = time.time()
+            _duration: Final = end_time - start_time
+            asyncio.create_task(
+                service_logger.async_service_success_hook(
+                    service=ServiceTypes.REDIS,
+                    duration=_duration,
+                    call_type="async_drain_list_to_processing",
+                    caller=_get_call_stack_info(),
+                )
+            )
+        except Exception as e:
+            failure_end_time: Final = time.time()
+            failure_duration: Final = failure_end_time - start_time
+            asyncio.create_task(
+                service_logger.async_service_failure_hook(
+                    service=ServiceTypes.REDIS,
+                    duration=failure_duration,
+                    error=e,
+                    call_type="async_drain_list_to_processing",
+                    caller=_get_call_stack_info(),
+                )
+            )
+            log_redis_failure(
+                verbose_logger,
+                logging.ERROR,
+                "LiteLLM Redis Caching: async_drain_list_to_processing() - Got exception from REDIS",
+                e,
+            )
+            raise
+        else:
+            return drained_items
+
+    @_redis_circuit_breaker_guard
+    async def async_ack_processing_list(self, key: str, worker_id: str) -> None:
+        _redis_client: Final = self._async_commands()
+        namespaced_key: Final = self.check_and_fix_namespace(key)
+        processing_key: Final = self._processing_list_key(
+            namespaced_key=namespaced_key,
+            worker_id=worker_id,
+        )
+        start_time: Final = time.time()
+        service_logger: Final = cast(  # cast-ok: logger has the required hooks
+            _RedisServiceLogger,
+            self.service_logger_obj,
+        )
+
+        try:
+            for attempt in range(3):
+                try:
+                    await _redis_client.delete(processing_key)
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+
+            end_time: Final = time.time()
+            _duration: Final = end_time - start_time
+            asyncio.create_task(
+                service_logger.async_service_success_hook(
+                    service=ServiceTypes.REDIS,
+                    duration=_duration,
+                    call_type="async_ack_processing_list",
+                    caller=_get_call_stack_info(),
+                )
+            )
+        except Exception as e:
+            failure_end_time: Final = time.time()
+            failure_duration: Final = failure_end_time - start_time
+            asyncio.create_task(
+                service_logger.async_service_failure_hook(
+                    service=ServiceTypes.REDIS,
+                    duration=failure_duration,
+                    error=e,
+                    call_type="async_ack_processing_list",
+                    caller=_get_call_stack_info(),
+                )
+            )
+            log_redis_failure(
+                verbose_logger,
+                logging.ERROR,
+                "LiteLLM Redis Caching: async_ack_processing_list() - Got exception from REDIS",
+                e,
+            )
+            raise
 
     @_redis_circuit_breaker_guard
     async def async_lpop_pipeline(
