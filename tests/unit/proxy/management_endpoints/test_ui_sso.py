@@ -10603,6 +10603,10 @@ class TestPersistReturnToCookieSharedHelper:
     def _cookie(resp) -> str:
         return resp.headers.get("set-cookie", "")
 
+    @pytest.fixture(autouse=True)
+    def _master_key(self, monkeypatch):
+        monkeypatch.setattr("litellm.proxy.proxy_server.master_key", "sk-test-master")
+
     def test_sets_cookie_for_same_origin_relative_path(self, monkeypatch):
         from fastapi import Response
 
@@ -10647,6 +10651,46 @@ class TestPersistReturnToCookieSharedHelper:
         resp = Response()
         _persist_return_to_cookie(resp, "https://cp.example.com/ui?page=models", _make_https_request())
         assert "litellm_cp_return_to=" in self._cookie(resp)
+
+    def test_cookie_is_opaque_and_round_trips_the_loopback_redirect_uri(self, monkeypatch):
+        """The DCR authorize round-trip for a local coding agent stores a return_to carrying
+        ``redirect_uri=http://127.0.0.1:<port>/...``. An edge firewall (AWS WAF
+        ``EC2MetaDataSSRF_COOKIE``) reads that loopback URL in a cookie as an SSRF probe and 403s the
+        callback, so the cookie must carry nothing a middlebox can pattern-match, while the proxy
+        itself still reads the exact return_to back."""
+        from fastapi import Response
+
+        from litellm.proxy.management_endpoints.ui_sso import _persist_return_to_cookie, read_return_to_cookie
+
+        monkeypatch.setattr("litellm.proxy.proxy_server.general_settings", {})
+        return_to = "/mcp/authorize?client_id=llm_dcrc_abc&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"
+        resp = Response()
+        _persist_return_to_cookie(resp, return_to, _make_https_request())
+        cookie = self._cookie(resp)
+        value = cookie.split("litellm_cp_return_to=", 1)[1].split(";", 1)[0]
+        assert "127.0.0.1" not in cookie and "authorize" not in cookie, cookie
+        request = _make_https_request()
+        request.cookies = {"litellm_cp_return_to": value}
+        assert read_return_to_cookie(request) == return_to
+
+    def test_a_cookie_this_proxy_did_not_seal_reads_as_nothing(self):
+        from litellm.proxy.management_endpoints.ui_sso import read_return_to_cookie
+
+        request = _make_https_request()
+        request.cookies = {"litellm_cp_return_to": "/mcp/authorize?client_id=llm_dcrc_abc"}
+        assert read_return_to_cookie(request) is None
+
+    def test_no_master_key_means_no_cookie_and_no_error(self, monkeypatch):
+        from fastapi import Response
+
+        from litellm.proxy.management_endpoints.ui_sso import _persist_return_to_cookie
+
+        monkeypatch.setattr("litellm.proxy.proxy_server.general_settings", {})
+        monkeypatch.setattr("litellm.proxy.proxy_server.master_key", None)
+        monkeypatch.delenv("LITELLM_SALT_KEY", raising=False)
+        resp = Response()
+        _persist_return_to_cookie(resp, "/mcp/authorize", _make_https_request())
+        assert "litellm_cp_return_to=" not in self._cookie(resp)
 
     def test_cookie_is_secure_and_httponly_over_https(self, monkeypatch):
         from fastapi import Response
